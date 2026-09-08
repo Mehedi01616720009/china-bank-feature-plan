@@ -1,26 +1,23 @@
 # FINAL_PLAN.md — CAI Coach (Module B) + CCC Voice AI (Module C)
 
-Locked stack: **FastAPI · Amazon Bedrock · PostgreSQL · Redis**.
-Locked integration pattern: **API-driven UI composition only — no vendor SDK, no embeddable widget.**
-
 ---
 
-## 1. Locked Decisions
+## 1. Tech and tools
 
-| Area | Decision | Replaces (from BRIEF/PLAN) |
-|---|---|---|
+| Area                  | Decision                                                                                                                                                                                                   | Replaces (from BRIEF/PLAN)                                                                                   |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | Front-end integration | Coach backend returns **UI Intent Schema** JSON; MyCBC renders with CBC-owned Backbase components. We ship the schema, the OpenAPI contract, a renderer conformance suite, and Figma↔schema token mapping. | Hybrid with thin embeddable conversation shell — dropped. Conversation panel is also schema-rendered by CBC. |
-| Backend | FastAPI (async), one codebase, two deployment units (`coach-api`, `voice-api`) sharing the orchestrator core package | — |
-| AI | Bedrock: Claude models (intent/entity/compose/rationale), Bedrock Guardrails (grounding + PII + denied topics), Bedrock Knowledge Bases with **Aurora PostgreSQL + pgvector** as the vector store | OpenSearch Serverless — dropped |
-| Primary datastore | PostgreSQL (Aurora PostgreSQL 16, `pgvector`, `pgcrypto`, `pg_partman`) | DynamoDB idempotency — dropped, moved to Postgres |
-| State / cache / bus | Redis (ElastiCache): session + journey hot state, resume-token index, response cache, rate limits, SSE fan-out, **Redis Streams** for internal async consumers | EventBridge + SQS — dropped |
-| Outbound events | Postgres **transactional outbox** → relay → Redis Streams (internal) + signed HTTP webhooks (external), CloudEvents 1.0 envelope | — |
-| Identity | Direct OIDC to CBC IdP (no Cognito broker). Entra ID / MSAL client-credentials leg retained for Dataverse/D365 only. | Cognito — dropped |
-| Voice I/O | Amazon Transcribe (streaming STT) + Amazon Polly (TTS) as channel adapters; dialogue logic stays in the shared orchestrator | — |
-| Compute | ECS Fargate, ALB, per-service autoscaling | — |
-| Archive | S3 + Object Lock for audit/transcript retention beyond the online window | — |
+| Backend               | FastAPI (async), one codebase, two deployment units (`coach-api`, `voice-api`) sharing the orchestrator core package                                                                                       | —                                                                                                            |
+| AI                    | Bedrock: Claude models (intent/entity/compose/rationale), Bedrock Guardrails (grounding + PII + denied topics), Bedrock Knowledge Bases with **Aurora PostgreSQL + pgvector** as the vector store          | OpenSearch Serverless — dropped                                                                              |
+| Primary datastore     | PostgreSQL (Aurora PostgreSQL 16, `pgvector`, `pgcrypto`, `pg_partman`)                                                                                                                                    | DynamoDB idempotency — dropped, moved to Postgres                                                            |
+| State / cache / bus   | Redis (ElastiCache): session + journey hot state, resume-token index, response cache, rate limits, SSE fan-out, **Redis Streams** for internal async consumers                                             | EventBridge + SQS — dropped                                                                                  |
+| Outbound events       | Postgres **transactional outbox** → relay → Redis Streams (internal) + signed HTTP webhooks (external), CloudEvents 1.0 envelope                                                                           | —                                                                                                            |
+| Identity              | Direct OIDC to CBC IdP (no Cognito broker). Entra ID / MSAL client-credentials leg retained for Dataverse/D365 only.                                                                                       | Cognito — dropped                                                                                            |
+| Voice I/O             | Amazon Transcribe (streaming STT) + Amazon Polly (TTS) as channel adapters; dialogue logic stays in the shared orchestrator                                                                                | —                                                                                                            |
+| Compute               | ECS Fargate, ALB, per-service autoscaling                                                                                                                                                                  | —                                                                                                            |
+| Archive               | S3 + Object Lock for audit/transcript retention beyond the online window                                                                                                                                   | —                                                                                                            |
 
-**Boundary rule:** Coach never calls Core Banking / Cards / Payments / CRM directly. Every call goes through the CBC EIP gateway. The LLM never emits an executable call — it emits a *proposed action*, and only the Action Executor (deterministic Python, no model in the path) issues the EIP request after policy + confirmation + step-up checks pass.
+**Boundary rule:** Coach never calls Core Banking / Cards / Payments / CRM directly. Every call goes through the CBC EIP gateway. The LLM never emits an executable call — it emits a _proposed action_, and only the Action Executor (deterministic Python, no model in the path) issues the EIP request after policy + confirmation + step-up checks pass.
 
 ---
 
@@ -261,29 +258,31 @@ Single versioned envelope, `schema_version: "1.0"`, additive-only within a major
 
 ```jsonc
 {
-  "schema_version": "1.0",
-  "turn_id": "uuid",
-  "journey_id": "uuid",
-  "locale": "fil-PH",
-  "speech": "Narito ang balanse mo.",          // short spoken/read text
-  "nodes": [ /* discriminated union on "type" */ ],
-  "telemetry": { "intent": "account_overview", "confidence": 0.94 }
+    "schema_version": "1.0",
+    "turn_id": "uuid",
+    "journey_id": "uuid",
+    "locale": "fil-PH",
+    "speech": "Narito ang balanse mo.", // short spoken/read text
+    "nodes": [
+        /* discriminated union on "type" */
+    ],
+    "telemetry": { "intent": "account_overview", "confidence": 0.94 },
 }
 ```
 
-| `type` | Purpose | Key fields |
-|---|---|---|
-| `text_block` | Short narrative | `body`, `emphasis` |
-| `intent_confirmation` | "You want to transfer…" | `slots[]` (editable, masked flags), `confidence`, `change_actions[]` |
-| `action_card` | CTA surface | `title`, `actions[]`, `disabled_reason`, `prerequisites[]` |
-| `form_spec` | Config-driven form | `fields[]` (type, mask, validators, helper_key, error_keys), `presentation: inline\|sheet\|modal` |
-| `review_confirmation` | Pre-execution review | `line_items[]`, `fees[]`, `limits[]`, `disclosure_refs[]`, `friction: standard\|high` |
-| `step_up_prompt` | Auth challenge | `challenge_id`, `methods[]`, `attempts_remaining`, `fallback_key`, `lockout_key` |
-| `receipt` | Post-execution | `reference`, `status`, `timestamp`, `share_policy`, `fields[]` |
-| `why_module` | Explainability | `basis_id`, `rationale`, `data_basis[]` (source, as_of), `citations[]` |
-| `feedback_control` | Rating / report | `subject_type`, `subject_id`, `reason_codes[]` |
-| `disclosure_block` | Compliance copy | `disclosure_code`, `version`, `locale`, `acknowledgement_required` |
-| `provenance_badge` | Data freshness | `source_system`, `as_of`, `staleness_state` |
+| `type`                | Purpose                 | Key fields                                                                                        |
+| --------------------- | ----------------------- | ------------------------------------------------------------------------------------------------- |
+| `text_block`          | Short narrative         | `body`, `emphasis`                                                                                |
+| `intent_confirmation` | "You want to transfer…" | `slots[]` (editable, masked flags), `confidence`, `change_actions[]`                              |
+| `action_card`         | CTA surface             | `title`, `actions[]`, `disabled_reason`, `prerequisites[]`                                        |
+| `form_spec`           | Config-driven form      | `fields[]` (type, mask, validators, helper_key, error_keys), `presentation: inline\|sheet\|modal` |
+| `review_confirmation` | Pre-execution review    | `line_items[]`, `fees[]`, `limits[]`, `disclosure_refs[]`, `friction: standard\|high`             |
+| `step_up_prompt`      | Auth challenge          | `challenge_id`, `methods[]`, `attempts_remaining`, `fallback_key`, `lockout_key`                  |
+| `receipt`             | Post-execution          | `reference`, `status`, `timestamp`, `share_policy`, `fields[]`                                    |
+| `why_module`          | Explainability          | `basis_id`, `rationale`, `data_basis[]` (source, as_of), `citations[]`                            |
+| `feedback_control`    | Rating / report         | `subject_type`, `subject_id`, `reason_codes[]`                                                    |
+| `disclosure_block`    | Compliance copy         | `disclosure_code`, `version`, `locale`, `acknowledgement_required`                                |
+| `provenance_badge`    | Data freshness          | `source_system`, `as_of`, `staleness_state`                                                       |
 
 Every rendered string is a **copy key**, never literal text — the renderer resolves key + locale, or the backend inlines the resolved string with the key retained for audit. Confirmation policy is data, not code: `review_confirmation.friction` and `action_card.confirmation_mode` come from a policy table (`high-risk → modal`, `low-risk → snackbar`) that product and engineering own jointly and can change without a release.
 
@@ -293,67 +292,77 @@ Governance: schema in a versioned repo, JSON Schema published in the OpenAPI `co
 
 ## 6. API Surface (contract-first — OpenAPI 3.1 generated from Pydantic, spec merged before implementation)
 
-| Method | Path | Notes |
-|---|---|---|
-| POST | `/v1/sessions` | creates session, returns capability manifest + consent state |
-| DELETE | `/v1/sessions/{sid}` | ends session, flushes hot state |
-| POST | `/v1/conversations/{sid}/messages` | `text/event-stream`; deltas then `ui_intent` frame |
-| POST | `/v1/conversations/{sid}/messages/{mid}/retry` | re-run turn, same journey node |
-| PATCH | `/v1/journeys/{jid}/slots` | entity correction, re-renders without restart |
-| POST | `/v1/journeys/{jid}/confirm` | advances to execution gate |
-| GET | `/v1/journeys/{jid}` | resume state for continuity |
-| GET | `/v1/accounts` | consolidated overview + provenance |
-| GET | `/v1/accounts/{ref}/transactions` | cursor paginated |
-| GET | `/v1/insights` | insight cards + `basis_id` per card |
-| POST | `/v1/insights/{id}/dismiss` | |
-| GET | `/v1/explanations/{basis_id}` | rationale, data basis, citations |
-| POST | `/v1/transfers` | `Idempotency-Key` required, step-up assertion required |
-| POST | `/v1/bill-payments` | as above |
-| POST | `/v1/cards/{ref}/lock` · `/unlock` | `Idempotency-Key`, step-up required |
-| GET | `/v1/cards/applications/{id}` | status inquiry |
-| GET | `/v1/recommendations` | NBO, suppressed when opted out |
-| POST | `/v1/recommendations/{id}/opt-out` | persisted state, not UI toggle |
-| POST · PATCH · POST | `/v1/applications` · `/{id}` · `/{id}/submit` | draft, save/resume, submit |
-| GET · POST · PATCH | `/v1/goals` | financial coaching |
-| POST | `/v1/step-up/challenges` · `/{cid}/verify` | reusable, interruptible |
-| POST | `/v1/resume-tokens` · `/v1/resume` | Assist → Coach continuity |
-| GET · POST | `/v1/consents` | scoped consent capture + query |
-| POST | `/v1/feedback` | routes to analytics + KB ops |
-| POST | `/v1/service-requests` | disputes / complaints |
-| POST | `/v1/voice/calls` · `/{id}/turns` · `/{id}/handoff` | Genesys-facing |
-| — | `webhooks:` section | `transfer.completed`, `application.status.changed`, `card.status.changed`, `nbo.campaign.triggered` |
+| Method              | Path                                                | Notes                                                                                               |
+| ------------------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| POST                | `/v1/sessions`                                      | creates session, returns capability manifest + consent state                                        |
+| DELETE              | `/v1/sessions/{sid}`                                | ends session, flushes hot state                                                                     |
+| POST                | `/v1/conversations/{sid}/messages`                  | `text/event-stream`; deltas then `ui_intent` frame                                                  |
+| POST                | `/v1/conversations/{sid}/messages/{mid}/retry`      | re-run turn, same journey node                                                                      |
+| PATCH               | `/v1/journeys/{jid}/slots`                          | entity correction, re-renders without restart                                                       |
+| POST                | `/v1/journeys/{jid}/confirm`                        | advances to execution gate                                                                          |
+| GET                 | `/v1/journeys/{jid}`                                | resume state for continuity                                                                         |
+| GET                 | `/v1/accounts`                                      | consolidated overview + provenance                                                                  |
+| GET                 | `/v1/accounts/{ref}/transactions`                   | cursor paginated                                                                                    |
+| GET                 | `/v1/insights`                                      | insight cards + `basis_id` per card                                                                 |
+| POST                | `/v1/insights/{id}/dismiss`                         |                                                                                                     |
+| GET                 | `/v1/explanations/{basis_id}`                       | rationale, data basis, citations                                                                    |
+| POST                | `/v1/transfers`                                     | `Idempotency-Key` required, step-up assertion required                                              |
+| POST                | `/v1/bill-payments`                                 | as above                                                                                            |
+| POST                | `/v1/cards/{ref}/lock` · `/unlock`                  | `Idempotency-Key`, step-up required                                                                 |
+| GET                 | `/v1/cards/applications/{id}`                       | status inquiry                                                                                      |
+| GET                 | `/v1/recommendations`                               | NBO, suppressed when opted out                                                                      |
+| POST                | `/v1/recommendations/{id}/opt-out`                  | persisted state, not UI toggle                                                                      |
+| POST · PATCH · POST | `/v1/applications` · `/{id}` · `/{id}/submit`       | draft, save/resume, submit                                                                          |
+| GET · POST · PATCH  | `/v1/goals`                                         | financial coaching                                                                                  |
+| POST                | `/v1/step-up/challenges` · `/{cid}/verify`          | reusable, interruptible                                                                             |
+| POST                | `/v1/resume-tokens` · `/v1/resume`                  | Assist → Coach continuity                                                                           |
+| GET · POST          | `/v1/consents`                                      | scoped consent capture + query                                                                      |
+| POST                | `/v1/feedback`                                      | routes to analytics + KB ops                                                                        |
+| POST                | `/v1/service-requests`                              | disputes / complaints                                                                               |
+| POST                | `/v1/voice/calls` · `/{id}/turns` · `/{id}/handoff` | Genesys-facing                                                                                      |
+| —                   | `webhooks:` section                                 | `transfer.completed`, `application.status.changed`, `card.status.changed`, `nbo.campaign.triggered` |
 
 Every response carries `X-Request-Id`, `X-Trace-Id`; errors use RFC 9457 `application/problem+json` with a `copy_key` so the client renders localized, non-leaking messages.
 
 Event envelope (CloudEvents 1.0):
+
 ```json
-{"specversion":"1.0","type":"ph.cbc.coach.transfer.completed","source":"/coach/action-executor",
- "id":"uuid","time":"2026-09-08T02:11:04Z","subject":"journey/<uuid>","datacontenttype":"application/json",
- "dataschema":"https://.../transfer.completed/1.0","data":{}}
+{
+    "specversion": "1.0",
+    "type": "ph.cbc.coach.transfer.completed",
+    "source": "/coach/action-executor",
+    "id": "uuid",
+    "time": "2026-09-08T02:11:04Z",
+    "subject": "journey/<uuid>",
+    "datacontenttype": "application/json",
+    "dataschema": "https://.../transfer.completed/1.0",
+    "data": {}
+}
 ```
+
 Outbound webhooks: HMAC-SHA256 signature + timestamp, at-least-once, exponential backoff (1s→2s→4s→…→1h, 12 attempts), dead-letter table, consumer dedupe on `id`.
 
 ---
 
 ## 7. Redis Key Model
 
-| Key | Type | TTL | Contents |
-|---|---|---|---|
-| `sess:{session_id}` | hash | 15m sliding | auth_level, customer_id, locale, entitlements, consent flags |
-| `jrny:{journey_id}` | hash | 30m sliding | state node, slots, last turn id, schema_version |
-| `jrny:idx:{customer_id}` | zset | 24h | active journeys by `updated_at` for resume |
-| `draft:{journey_id}:form` | string (json) | 30m | in-progress form values, never contains full PAN/OTP |
-| `resume:{token_hash}` | string | 10m | journey_id, single-use, `GETDEL` |
-| `acct:{customer_id}:casa` | string (json) | 60s | balances + `as_of` |
-| `acct:{customer_id}:cards` | string (json) | 300s | card list + status |
-| `kb:{query_hash}:{locale}` | string (json) | 10m | retrieval results + citations |
-| `copy:{locale}:{version}` | hash | 1h | published copy strings |
-| `idem:lock:{key_hash}` | string | 60s | `SET NX` in-flight guard ahead of the Postgres row |
-| `stepup:{challenge_id}` | hash | challenge TTL | attempts, method, nonce |
-| `rl:{customer_id}:{window}` | string | window | token bucket per customer + per endpoint class |
-| `sse:{session_id}` | pub/sub | — | fan-out of turn frames across Fargate tasks |
-| `stream:coach.events` | stream | maxlen 1M | internal consumers: telemetry, NBO tracking, notifications |
-| `stream:coach.dlq` | stream | 30d | poisoned messages |
+| Key                         | Type          | TTL           | Contents                                                     |
+| --------------------------- | ------------- | ------------- | ------------------------------------------------------------ |
+| `sess:{session_id}`         | hash          | 15m sliding   | auth_level, customer_id, locale, entitlements, consent flags |
+| `jrny:{journey_id}`         | hash          | 30m sliding   | state node, slots, last turn id, schema_version              |
+| `jrny:idx:{customer_id}`    | zset          | 24h           | active journeys by `updated_at` for resume                   |
+| `draft:{journey_id}:form`   | string (json) | 30m           | in-progress form values, never contains full PAN/OTP         |
+| `resume:{token_hash}`       | string        | 10m           | journey_id, single-use, `GETDEL`                             |
+| `acct:{customer_id}:casa`   | string (json) | 60s           | balances + `as_of`                                           |
+| `acct:{customer_id}:cards`  | string (json) | 300s          | card list + status                                           |
+| `kb:{query_hash}:{locale}`  | string (json) | 10m           | retrieval results + citations                                |
+| `copy:{locale}:{version}`   | hash          | 1h            | published copy strings                                       |
+| `idem:lock:{key_hash}`      | string        | 60s           | `SET NX` in-flight guard ahead of the Postgres row           |
+| `stepup:{challenge_id}`     | hash          | challenge TTL | attempts, method, nonce                                      |
+| `rl:{customer_id}:{window}` | string        | window        | token bucket per customer + per endpoint class               |
+| `sse:{session_id}`          | pub/sub       | —             | fan-out of turn frames across Fargate tasks                  |
+| `stream:coach.events`       | stream        | maxlen 1M     | internal consumers: telemetry, NBO tracking, notifications   |
+| `stream:coach.dlq`          | stream        | 30d           | poisoned messages                                            |
 
 Redis is a cache and a hot-state tier only. Every value in it is reconstructable from Postgres; a full Redis flush degrades latency, never correctness.
 
@@ -509,12 +518,14 @@ CREATE INDEX idem_action_idx ON coach.idempotency_key (action_id) WHERE action_i
 ```
 
 Executor contract:
+
 ```sql
 INSERT INTO coach.idempotency_key (customer_id, endpoint, idem_key, request_hash, status, expires_at)
 VALUES ($1,$2,$3,$4,'in_flight', now() + interval '24 hours')
 ON CONFLICT (customer_id, endpoint, idem_key) DO NOTHING
 RETURNING 1;
 ```
+
 No row returned → same key seen before: if `request_hash` differs return 422, if `status='in_flight'` return 409 with retry-after, otherwise replay the stored response.
 
 ### 8.4 Actions and money movement
@@ -958,16 +969,16 @@ Read replicas: one for analytics/drift dashboards, one for compliance/audit quer
 
 ## 9. Latency, Reliability, Provenance
 
-| Concern | Approach | Target |
-|---|---|---|
-| Account overview | `asyncio.gather` across CASA/cards/activity via EIP, per-source Redis TTL, partial render on one-source failure | p95 ≤ 1.2s |
-| First token of a chat turn | Streaming Bedrock invoke, guardrail on input only before first token, output guardrail buffered per sentence | p95 TTFB ≤ 900ms |
-| Action execution | Deterministic path, no model call | p95 ≤ 2.5s excluding EIP |
-| Downstream failure | Circuit breaker per EIP route, bulkhead pools, budgeted retries (idempotent GETs only) | no cascading timeout |
-| Stale data | Every numeric field carries `{source_system, as_of}`; renderer shows `provenance_badge` when `now - as_of` exceeds the per-source freshness threshold | never present stale as authoritative |
-| Partial data | Overview renders the sources that answered plus an explicit "couldn't load cards" block with retry action | no silent gaps |
-| Error UX | Every orchestration step maps to a `problem+json` type → `copy_key` → localized card; raw upstream errors never reach the client | no raw leakage |
-| Unknown transaction state | `action_execution.status='unknown'` + reconciliation worker polling EIP; receipt shows "verifying", resolves via webhook or poll | no phantom success |
+| Concern                    | Approach                                                                                                                                              | Target                               |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| Account overview           | `asyncio.gather` across CASA/cards/activity via EIP, per-source Redis TTL, partial render on one-source failure                                       | p95 ≤ 1.2s                           |
+| First token of a chat turn | Streaming Bedrock invoke, guardrail on input only before first token, output guardrail buffered per sentence                                          | p95 TTFB ≤ 900ms                     |
+| Action execution           | Deterministic path, no model call                                                                                                                     | p95 ≤ 2.5s excluding EIP             |
+| Downstream failure         | Circuit breaker per EIP route, bulkhead pools, budgeted retries (idempotent GETs only)                                                                | no cascading timeout                 |
+| Stale data                 | Every numeric field carries `{source_system, as_of}`; renderer shows `provenance_badge` when `now - as_of` exceeds the per-source freshness threshold | never present stale as authoritative |
+| Partial data               | Overview renders the sources that answered plus an explicit "couldn't load cards" block with retry action                                             | no silent gaps                       |
+| Error UX                   | Every orchestration step maps to a `problem+json` type → `copy_key` → localized card; raw upstream errors never reach the client                      | no raw leakage                       |
+| Unknown transaction state  | `action_execution.status='unknown'` + reconciliation worker polling EIP; receipt shows "verifying", resolves via webhook or poll                      | no phantom success                   |
 
 ---
 
@@ -1004,109 +1015,80 @@ Read replicas: one for analytics/drift dashboards, one for compliance/audit quer
 
 ## 13. Problem Coverage
 
-| PROBLEMS # | Resolved by |
-|---|---|
-| 1 | §1 — API-driven only, no SDK |
-| 2 | §6 — OpenAPI 3.1 from Pydantic, spec-first merge gate, `webhooks` section |
-| 3 | §5 — UI Intent Schema v1, discriminated union, additive versioning, conformance suite |
-| 4 | §5 — copy keys + token mapping + Figma↔schema table; CBC owns components |
-| 5 | §1, §10 — EIP-only boundary, per-journey scopes |
-| 6 | §6, §8.7 — outbox → Redis Streams + signed webhooks, CloudEvents, retry/DLQ |
-| 7 | §1 — all 10 components rendered by CBC Backbase components from schema |
-| 8 | §3 — Claude tool-schema-constrained intent/entity extraction |
-| 9 | §7, §8.1 — Redis hot state + Postgres `journey` as source of truth |
-| 10 | §6 — `PATCH /journeys/{id}/slots` re-renders in place, no restart |
-| 11 | §12 — pre-classification language ID, BCP 47 tags on `message.lang_tag` |
-| 12 | §8.9 — Bedrock KB on pgvector, `kb.document` version ledger, citations |
-| 13 | §11 — Guardrails grounding check + deterministic fallback |
-| 14 | §8.5, §11 — `explanation_basis` written transactionally |
-| 15 | §10 — projected, masked session context per journey |
-| 16 | §10 — OIDC + PKCE, sender-constrained tokens, JWKS rotation |
-| 17 | §8.3 — `step_up_challenge` with `pending_action`, interruptible/resumable |
-| 18 | §4 Flow 2, §8.3 — opaque single-use token, hash-only storage, 10m TTL |
-| 19 | §8.3 — Postgres conditional insert + Redis in-flight lock |
-| 20 | §10 — Entra ID client credentials, service-scoped token cache |
-| 21 | §1, §3 — model proposes, executor decides; closed action enumeration |
-| 22 | §12 — schema-rendered native Backbase UI, WCAG 2.2 AA renderer contract |
-| 23 | §6 — SSE streaming, `edited_of` on `message`, retry endpoint, `share_policy` |
-| 24 | §5 — `why_module` / collapsible nodes standard across all cards |
-| 25 | §5 — confirmation policy table drives `friction` / `confirmation_mode` |
-| 26 | §5 — `form_spec` node, one renderer for all journeys |
-| 27 | §5 — `disclosure_refs` resolved from `content.disclosure` at render time |
-| 28 | §5, §8.4 — `receipt` node + `share_policy`, masked fields only |
-| 29 | §8.8 — `experiment_assignment` for placement A/B; capability manifest gates entitlement |
-| 30 | §9 — parallel fetch, per-source TTL, partial render |
-| 31 | §9 — provenance per field, primary reads for money paths |
-| 32 | §8.5, §9 — `insight.provenance`, `provenance_badge` node |
-| 33 | §9 — `problem+json` → `copy_key`, defined failure UX per step |
-| 34 | §8.8, §11 — hash-chained partitioned audit log |
-| 35 | §8.6 — `consent_event` + `consent_state`, queryable, enforced pre-composition |
-| 36 | §11 — control matrix with evidence links |
-| 37 | §11, §8.8 — `model_invocation` feed, drift dashboards from Foundation |
-| 38 | §8.6, §8.10 — data minimization by schema, `privacy_incident` with 72h computed due date |
-| 39 | §5 — missing disclosure blocks the render; structural, not optional copy |
-| 40 | §12, §8.9 — `content.copy_string`, ICU formatting |
-| 41 | §12 — live-region streaming announcements, axe + manual a11y gates in CI |
-| 42 | §12 — senior persona test lane |
-| 43 | §14 — acceptance test matrix in CI |
-| 44 | §14 — six persona test lanes |
-| 45 | §14 — Flow 2 contract + end-to-end regression suite on every release |
-| 46 | §4 Flow C — Genesys webhooks + audio WS, handoff packet |
-| 47 | §4 Flow C — Transcribe streaming with en-PH/fil-PH custom vocabulary + code-switch handling |
-| 48 | §4 Flow C — spoken confirmation before action, low-confidence clarification loop |
-| 49 | §8.10 — `verification_status` gate before any protected disclosure |
-| 50 | §8.10 — `handoff_packet`, redacted transcripts only |
-| 51 | §1 — shared orchestrator core package, two deployment units, shared `journey` rows |
-| 52 | §15 |
-| 53 | §15 — MVP scope frozen to mandatory journeys |
-| 54 | §15 — telemetry in Phase 1, not Phase 4 |
-| 55 | §15 — BAU runbook + owning team as a Phase 4 exit criterion |
+| PROBLEMS # | Resolved by                                                                                |
+| ---------- | ------------------------------------------------------------------------------------------ |
+| 1          | 1 — API-driven only                                                                        |
+| 2          | 6 — OpenAPI 3.1 from Pydantic, spec-first merge gate, `webhooks` section                   |
+| 3          | 5 — UI Intent Schema v1, discriminated union, additive versioning, conformance suite       |
+| 4          | 5 — copy keys + token mapping + Figma↔schema table; CBC owns components                    |
+| 5          | 1, 10 — EIP-only boundary, per-journey scopes                                              |
+| 6          | 6, 8.7 — outbox → Redis Streams + signed webhooks, CloudEvents, retry/DLQ                  |
+| 7          | 1 — all 10 components rendered by CBC Backbase components from schema                      |
+| 8          | 3 — Claude tool-schema-constrained intent/entity extraction                                |
+| 9          | 7, 8.1 — Redis hot state + Postgres `journey` as source of truth                           |
+| 10         | 6 — `PATCH /journeys/{id}/slots` re-renders in place, no restart                           |
+| 11         | 12 — pre-classification language ID, BCP 47 tags on `message.lang_tag`                     |
+| 12         | 8.9 — Bedrock KB on pgvector, `kb.document` version ledger, citations                      |
+| 13         | 11 — Guardrails grounding check + deterministic fallback                                   |
+| 14         | 8.5, 11 — `explanation_basis` written transactionally                                      |
+| 15         | 10 — projected, masked session context per journey                                         |
+| 16         | 10 — OIDC + PKCE, sender-constrained tokens, JWKS rotation                                 |
+| 17         | 8.3 — `step_up_challenge` with `pending_action`, interruptible/resumable                   |
+| 18         | 4 Flow 2, 8.3 — opaque single-use token, hash-only storage, 10m TTL                        |
+| 19         | 8.3 — Postgres conditional insert + Redis in-flight lock                                   |
+| 20         | 10 — Entra ID client credentials, service-scoped token cache                               |
+| 21         | 1, 3 — model proposes, executor decides; closed action enumeration                         |
+| 22         | 12 — schema-rendered native Backbase UI, WCAG 2.2 AA renderer contract                     |
+| 23         | 6 — SSE streaming, `edited_of` on `message`, retry endpoint, `share_policy`                |
+| 24         | 5 — `why_module` / collapsible nodes standard across all cards                             |
+| 25         | 5 — confirmation policy table drives `friction` / `confirmation_mode`                      |
+| 26         | 5 — `form_spec` node, one renderer for all journeys                                        |
+| 27         | 5 — `disclosure_refs` resolved from `content.disclosure` at render time                    |
+| 28         | 5, 8.4 — `receipt` node + `share_policy`, masked fields only                               |
+| 29         | 8.8 — `experiment_assignment` for placement A/B; capability manifest gates entitlement     |
+| 30         | 9 — parallel fetch, per-source TTL, partial render                                         |
+| 31         | 9 — provenance per field, primary reads for money paths                                    |
+| 32         | 8.5, 9 — `insight.provenance`, `provenance_badge` node                                     |
+| 33         | 9 — `problem+json` → `copy_key`, defined failure UX per step                               |
+| 34         | 8.8, 11 — hash-chained partitioned audit log                                               |
+| 35         | 8.6 — `consent_event` + `consent_state`, queryable, enforced pre-composition               |
+| 36         | 11 — control matrix with evidence links                                                    |
+| 37         | 11, 8.8 — `model_invocation` feed, drift dashboards from Foundation                        |
+| 38         | 8.6, 8.10 — data minimization by schema, `privacy_incident` with 72h computed due date     |
+| 39         | 5 — missing disclosure blocks the render; structural, not optional copy                    |
+| 40         | 12, 8.9 — `content.copy_string`, ICU formatting                                            |
+| 41         | 12 — live-region streaming announcements, axe + manual a11y gates in CI                    |
+| 42         | 12 — senior persona test lane                                                              |
+| 43         | 14 — acceptance test matrix in CI                                                          |
+| 44         | 14 — six persona test lanes                                                                |
+| 45         | 14 — Flow 2 contract + end-to-end regression suite on every release                        |
+| 46         | 4 Flow C — Genesys webhooks + audio WS, handoff packet                                     |
+| 47         | 4 Flow C — Transcribe streaming with en-PH/fil-PH custom vocabulary + code-switch handling |
+| 48         | 4 Flow C — spoken confirmation before action, low-confidence clarification loop            |
+| 49         | 8.10 — `verification_status` gate before any protected disclosure                          |
+| 50         | 8.10 — `handoff_packet`, redacted transcripts only                                         |
+| 51         | 1 — shared orchestrator core package, two deployment units, shared `journey` rows          |
+| 52         | §15                                                                                        |
+| 53         | 15 — MVP scope frozen to mandatory journeys                                                |
+| 54         | 15 — telemetry in Phase 1, not Phase 4                                                     |
+| 55         | 15 — BAU runbook + owning team as a Phase 4 exit criterion                                 |
 
 ---
 
 ## 14. Testing & Acceptance
 
-| Test | Automation |
-|---|---|
-| B-AT-01 orchestration + SLA | Contract test against `GET /v1/accounts` with EIP stubs at p95 latency budget; correctness diffed against system-of-record fixtures |
-| B-AT-02 sensitive action | End-to-end transfer with forced step-up; asserts `action_execution.step_up_challenge_id` non-null and matching `audit_log` rows with a transaction reference |
-| B-AT-03 session continuity | Journey interleaving suite: start transfer → switch to insights → background app → resume; asserts zero re-prompted slots |
-| B-AT-04 explainability | Generate 20 recommendations, assert each has a resolvable `basis_id` with non-empty `retrieved` and `inputs` |
-| B-AT-05 security review | Control matrix export + SAST/DAST/dependency scan artifacts + pen-test report |
-| Cards identity verification | Lock/unlock requires `auth_level=2`; negative test asserts 403 without step-up |
-| Renderer conformance | Golden UI Intent Schema payloads → expected rendered tree, run in CBC mobile CI |
-| Persona lanes | Six suites (digital native, mass retail, affluent, senior/accessibility, power user, ops/risk) with distinct assertions on step count, disclosure presence, and a11y |
-| Guardrail regression | Adversarial prompt corpus (injection, unsafe claims, PII exfiltration) run per model/prompt change |
-| Flow 2 cross-system | Nightly regression across Assist, IdP, and Coach with token replay and expiry negative cases |
-| Load | Sustained overview + chat mix at 2× peak; Redis flush test asserting correctness under cold cache |
+| Test                        | Automation                                                                                                                                                           |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| B-AT-01 orchestration + SLA | Contract test against `GET /v1/accounts` with EIP stubs at p95 latency budget; correctness diffed against system-of-record fixtures                                  |
+| B-AT-02 sensitive action    | End-to-end transfer with forced step-up; asserts `action_execution.step_up_challenge_id` non-null and matching `audit_log` rows with a transaction reference         |
+| B-AT-03 session continuity  | Journey interleaving suite: start transfer → switch to insights → background app → resume; asserts zero re-prompted slots                                            |
+| B-AT-04 explainability      | Generate 20 recommendations, assert each has a resolvable `basis_id` with non-empty `retrieved` and `inputs`                                                         |
+| B-AT-05 security review     | Control matrix export + SAST/DAST/dependency scan artifacts + pen-test report                                                                                        |
+| Cards identity verification | Lock/unlock requires `auth_level=2`; negative test asserts 403 without step-up                                                                                       |
+| Renderer conformance        | Golden UI Intent Schema payloads → expected rendered tree, run in CBC mobile CI                                                                                      |
+| Persona lanes               | Six suites (digital native, mass retail, affluent, senior/accessibility, power user, ops/risk) with distinct assertions on step count, disclosure presence, and a11y |
+| Guardrail regression        | Adversarial prompt corpus (injection, unsafe claims, PII exfiltration) run per model/prompt change                                                                   |
+| Flow 2 cross-system         | Nightly regression across Assist, IdP, and Coach with token replay and expiry negative cases                                                                         |
+| Load                        | Sustained overview + chat mix at 2× peak; Redis flush test asserting correctness under cold cache                                                                    |
 
 ---
-
-## 15. Delivery Plan (2-week sprints)
-
-**Phase 1 — Foundation (S1–S3)**
-OpenAPI skeleton for all mandatory journeys including `webhooks`; UI Intent Schema v1 + renderer conformance harness + Figma/token mapping; Postgres schema v1 with partitioning and migrations (Alembic); Redis key model; security model (OIDC, step-up, resume token, idempotency) signed off; Bedrock Guardrails + Knowledge Base on pgvector provisioned with one ECMS corpus; telemetry and `model_invocation` pipeline live; persona UX discovery + prototypes.
-*Exit:* CBC sign-off on journeys, schema, security model, EIP scope model.
-
-**Phase 2 — MVP (S4–S11)**
-Conversation turn pipeline end-to-end with SSE; account overview with provenance and partial-failure UX; insights v1 with basis logging and grounding; transfer + bill pay with step-up, idempotency, receipts, reconciliation worker; consent capture + audit v1; en/fil/Taglish copy system; a11y gates in CI.
-*Exit:* B-AT-01, B-AT-02, B-AT-03 pass; SLA met under load.
-
-**Phase 3 — Expansion (S12–S21)**
-Apply flow (NBO → D365 draft → submit → status webhook); cards lock/unlock + application status; disputes/service requests; Flow 2 continuity with full regression; `why_module` with citations hardened; outbox/webhook delivery to external consumers; Voice MVP (Genesys routing, Transcribe/Polly tuned for PH accents and code-switching, voice identity verification, handoff packet).
-*Exit:* B-AT-04, B-AT-05 pass; mandatory + optional requirements met.
-
-**Phase 4 — Optimization (ongoing)**
-NBO funnel experimentation and entry-point A/B; drift dashboards and AI RMF measure/manage cadence; guardrail and prompt tuning driven by `feedback` triage; partition/retention automation verified; BAU handover.
-*Exit:* SLA/KPI stabilization; signed-off BAU runbook and owning team.
-
----
-
-## 16. Open Items for CBC
-
-1. Web Coach in scope, or mobile-only.
-2. EIP contract availability dates per domain (accounts, transfers, cards, CRM) — drives Phase 2 sequencing more than anything else in this plan.
-3. High-risk action definition table (what forces modal + step-up) — blocks form renderer and review screen work.
-4. Voice identity-assurance method (voice OTP vs KBA vs telephony-linked).
-5. Genesys integration depth (routing + handoff only, or full agent-assist).
-6. Transcript and audio retention periods per the DPA consent scopes.
